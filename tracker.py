@@ -22,30 +22,33 @@ import subprocess
 import tempfile
 import cv2
 import numpy as np
+import csv
 
 
 # ── Kalman Filter ─────────────────────────────────────────────────────────────
 
 def make_kalman(cx, cy, dt):
     """Constant-velocity Kalman filter: state = [x, y, vx, vy]."""
+    # 4- dynamic states (2 pos and 2 vel)
+    # 2- measurement dimensions (x, y)
     kf = cv2.KalmanFilter(4, 2)
     kf.transitionMatrix = np.array([
-        [1, 0, dt, 0],
-        [0, 1, 0, dt],
-        [0, 0, 1,  0],
+        [1, 0, dt, 0], #xnew  = x + vx*dt
+        [0, 1, 0, dt], #ynew  = y + vy*dt
+        [0, 0, 1,  0], #vxnew = vx
         [0, 0, 0,  1]], dtype=np.float32)
     kf.measurementMatrix = np.eye(2, 4, dtype=np.float32)
-    kf.processNoiseCov = np.eye(4, dtype=np.float32) * 5.0
-    kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 1.0
-    kf.errorCovPost = np.eye(4, dtype=np.float32)
-    kf.statePost = np.array([[cx], [cy], [0], [0]], dtype=np.float32)
+    kf.processNoiseCov = np.eye(4, dtype=np.float32) * 5.0 #expect the true position and veloicty to deviate from math by 5 unit variance. 
+    kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 1.0 #measurement is at 1 unit variance (mostly accurate csrt measurement)
+    kf.errorCovPost = np.eye(4, dtype=np.float32) #inherent uncertainty in the system
+    kf.statePost = np.array([[cx], [cy], [0], [0]], dtype=np.float32) #state after making the prediction using both csrt and kalman filter
     return kf
 
 
 def create_csrt():
     """CSRT with a wider search window."""
     params = cv2.TrackerCSRT_Params()
-    params.padding = 13.0
+    params.padding = 15.0
     return cv2.TrackerCSRT_create(params)
 
 
@@ -62,7 +65,7 @@ class CameraCompensator:
       to_world(pt)   – convert current-frame pixel → world pixel
       to_frame(pt)   – convert world pixel → current-frame pixel
     """
-
+    
     LK_PARAMS = dict(
         winSize=(21, 21),
         maxLevel=3,
@@ -268,6 +271,8 @@ class Physics:
         self.dt = 1.0 / fps
         self.positions = []      # list of (x, y) in pixels
         self.total_dist = 0.0    # cumulative path length in metres
+        self.time_elapsed = 0.0  # New: Track time for CSV
+        self.history = []        # New: Store frame data
 
         # Precompute Savitzky-Golay convolution coefficients for 1st and
         # 2nd derivatives, quadratic fit, evaluated at the rightmost point
@@ -311,6 +316,38 @@ class Physics:
         if self.positions:
             self.total_dist += np.linalg.norm(p - self.positions[-1]) * self.scale
         self.positions.append(p)
+        self.time_elapsed += self.dt
+
+        # Calculate current state metrics
+        d_vec, d_mag = self.displacement
+        v_vec, v_mag = self.velocity
+        a_vec, a_mag = self.acceleration
+
+        # Log frame data
+        self.history.append({
+            'Time (s)': round(self.time_elapsed, 4),
+            'Pos X (m)': round(d_vec[0], 4),
+            'Pos Y (m)': round(d_vec[1], 4),
+            'Displacement (m)': round(d_mag, 4),
+            'Distance (m)': round(self.total_dist, 4),
+            'Vel X (m/s)': round(v_vec[0], 4),
+            'Vel Y (m/s)': round(v_vec[1], 4),
+            'Speed (m/s)': round(v_mag, 4),
+            'Acc X (m/s²)': round(a_vec[0], 4),
+            'Acc Y (m/s²)': round(a_vec[1], 4),
+            'Accel Mag (m/s²)': round(a_mag, 4)
+        })
+
+    def export_csv(self, filename="tracking_data.csv"):
+        """Exports the tracked history to a CSV file."""
+        if not self.history:
+            return
+        keys = self.history[0].keys()
+        with open(filename, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=keys)
+            writer.writeheader()
+            writer.writerows(self.history)
+        print(f"\n[+] Frame-by-frame data exported to {filename}")
 
     def to_metres(self, px_vec):
         """Convert pixel vector to metres (y-flipped: up = positive)."""
@@ -529,6 +566,8 @@ def main():
     while True:
         ret, frame = cap.read()
         if not ret:
+            if physics: 
+                physics.export_csv()
             return
 
         # ── Step 1: Select object ──
@@ -598,7 +637,7 @@ def main():
                 if slowdown <= 1 or frame_count % int(round(frames_per_orig)) == 0:
                     physics.update(world_center)
 
-                # Draw CSRT detection (blue) — in current frame coords
+                # draw csrt detection in current frame coordinates.
                 cv2.rectangle(frame, (x, y), (x + w, y + h), (255, 0, 0), 1)
             else:
                 lost += 1
@@ -624,12 +663,16 @@ def main():
             cv2.imshow("Tracker", frame)
             key = cv2.waitKey(frame_delay) & 0xFF
             if key == ord('q'):
+                if physics: 
+                    physics.export_csv()
                 cap.release()
                 if tmp_path:
                     os.unlink(tmp_path)
                 cv2.destroyAllWindows()
                 return
             if key == ord('r'):
+                if physics: 
+                    physics.export_csv()
                 break  # reselect
 
     cap.release()
